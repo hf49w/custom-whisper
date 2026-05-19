@@ -11,6 +11,8 @@ if ! command -v conda >/dev/null 2>&1; then
   exit 1
 fi
 
+# `conda shell.bash hook` may reference PS1 even in non-interactive shells.
+export PS1="${PS1-}"
 eval "$(conda shell.bash hook)"
 
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
