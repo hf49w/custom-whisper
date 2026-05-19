@@ -46,6 +46,7 @@ DIM_SPEECH_INTER="${DIM_SPEECH_INTER:-128}"
 DIM_VISUAL_INTER="${DIM_VISUAL_INTER:-128}"
 CKPT_NAME="${CKPT_NAME:-best_train_loss.pt}"
 FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
+ALLOW_RELOCATED_PATHS="${ALLOW_RELOCATED_PATHS:-0}"
 
 ENABLE_SPECAUG="${ENABLE_SPECAUG:-0}"
 SPECAUG_TIME_WARP="${SPECAUG_TIME_WARP:-1}"
@@ -156,6 +157,9 @@ elif [[ -f "$LAST_CHECKPOINT" && "$TRAIN_MANIFEST" -nt "$LAST_CHECKPOINT" ]]; th
 elif [[ -f "$LAST_CHECKPOINT" ]]; then
   echo "[TRAIN] resume_from=$LAST_CHECKPOINT"
   train_args+=(--resume-from "$LAST_CHECKPOINT")
+  if [[ "$ALLOW_RELOCATED_PATHS" == "1" ]]; then
+    train_args+=(--allow-relocated-paths)
+  fi
 else
   echo "[TRAIN] fresh_start"
 fi

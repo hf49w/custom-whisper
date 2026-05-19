@@ -79,6 +79,11 @@ LEGACY_RESUME_DEFAULTS = {
     "max_train_samples": 0,
 }
 
+RELOCATABLE_PATH_KEYS = {
+    "train_manifest",
+    "clip_model_name",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -149,6 +154,14 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional checkpoint path such as checkpoints/last.pt. Resumes optimizer, history, and epoch counter.",
+    )
+    parser.add_argument(
+        "--allow-relocated-paths",
+        action="store_true",
+        help=(
+            "Allow resume when path-like config values such as train_manifest or clip_model_name moved "
+            "to a different machine or directory. Use only when the copied data/model assets are the same."
+        ),
     )
     parser.add_argument(
         "--force-retrain",
@@ -328,6 +341,7 @@ def validate_resume_checkpoint(
     *,
     expected_config: Dict[str, Any],
     checkpoint_path: Path,
+    allow_relocated_paths: bool,
 ) -> None:
     raw_checkpoint_config = checkpoint.get("train_config")
     if not isinstance(raw_checkpoint_config, dict):
@@ -341,6 +355,14 @@ def validate_resume_checkpoint(
         actual_value = checkpoint_config.get(key)
         if key == "max_train_samples" and actual_value is None:
             actual_value = 0
+        if (
+            allow_relocated_paths
+            and key in RELOCATABLE_PATH_KEYS
+            and actual_value is not None
+            and expected_value is not None
+            and actual_value != expected_value
+        ):
+            continue
         if actual_value != expected_value:
             mismatches.append(f"{key}: checkpoint={actual_value!r} current={expected_value!r}")
     if mismatches:
@@ -491,6 +513,7 @@ def main() -> None:
             resume_checkpoint,
             expected_config=resume_compat_config,
             checkpoint_path=resume_from_path,
+            allow_relocated_paths=args.allow_relocated_paths,
         )
 
     model = custom_whisper.load_audio_image_model(
@@ -581,6 +604,7 @@ def main() -> None:
         "device": str(device),
         "freeze_stats": freeze_stats,
         "resume_from": str(resume_from_path) if resume_from_path is not None else "",
+        "allow_relocated_paths": bool(args.allow_relocated_paths),
         "specaug_enabled": specaug_config is not None,
         "specaug_config": specaug_config.to_dict() if specaug_config is not None else None,
     }
@@ -629,6 +653,8 @@ def main() -> None:
         completed_epochs = start_epoch - 1
         print(f"[INFO] resume_from={resume_from_path}")
         print(f"[INFO] completed_epochs={completed_epochs} target_epochs={args.epochs}")
+        if args.allow_relocated_paths:
+            print("[INFO] allow_relocated_paths=1")
         if resume_batch_index > 0:
             print(f"[INFO] resume_batch_index={resume_batch_index}")
 

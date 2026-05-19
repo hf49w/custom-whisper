@@ -84,6 +84,8 @@ Outputs are written under `outputs/<suite_tag>/`.
 
 The training script now refreshes `last.pt` every `SAVE_EVERY_BATCHES` completed batches, so a killed job can resume inside the same epoch instead of restarting that epoch from batch 1.
 
+If you move a half-trained run from one machine to another and the manifest / local CLIP cache path changes, resume with `ALLOW_RELOCATED_PATHS=1`.
+
 Manual resume example:
 
 ```bash
@@ -93,5 +95,6 @@ python scripts/train_visspeech_custom_whisper_fuser.py \
   --whisper-model medium.en \
   --visual-encoder clip \
   --visual-fuser cross_attn_gate \
-  --resume-from outputs/my_resume_run/model/checkpoints/last.pt
+  --resume-from outputs/my_resume_run/model/checkpoints/last.pt \
+  --allow-relocated-paths
 ```
