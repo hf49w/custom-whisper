@@ -62,9 +62,22 @@ RESUME_COMPAT_KEYS = (
     "attn_dropout",
     "attn_gate_init",
     "attn_num_queries",
+    "batch_size",
+    "seed",
+    "max_train_samples",
     "specaug_enabled",
     "specaug_config",
 )
+
+LEGACY_RESUME_DEFAULTS = {
+    "specaug_enabled": False,
+    "specaug_config": None,
+    "attn_num_heads": 8,
+    "attn_dropout": 0.1,
+    "attn_gate_init": -4.0,
+    "attn_num_queries": 8,
+    "max_train_samples": 0,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +134,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument(
+        "--save-every-batches",
+        type=int,
+        default=100,
+        help="Overwrite last.pt every N completed batches so interrupted runs can resume within an epoch.",
+    )
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--whisper-download-root", type=str, default="")
@@ -296,6 +315,9 @@ def build_resume_compat_config(
         "attn_dropout": args.attn_dropout,
         "attn_gate_init": args.attn_gate_init,
         "attn_num_queries": args.attn_num_queries,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "max_train_samples": args.max_train_samples,
         "specaug_enabled": specaug_config is not None,
         "specaug_config": specaug_config.to_dict() if specaug_config is not None else None,
     }
@@ -311,16 +333,14 @@ def validate_resume_checkpoint(
     if not isinstance(raw_checkpoint_config, dict):
         raise ValueError(f"Resume checkpoint is missing train_config: {checkpoint_path}")
     checkpoint_config = dict(raw_checkpoint_config)
-    checkpoint_config.setdefault("specaug_enabled", False)
-    checkpoint_config.setdefault("specaug_config", None)
-    checkpoint_config.setdefault("attn_num_heads", 8)
-    checkpoint_config.setdefault("attn_dropout", 0.1)
-    checkpoint_config.setdefault("attn_gate_init", -4.0)
-    checkpoint_config.setdefault("attn_num_queries", 8)
+    for key, default_value in LEGACY_RESUME_DEFAULTS.items():
+        checkpoint_config.setdefault(key, default_value)
     mismatches: List[str] = []
     for key in RESUME_COMPAT_KEYS:
         expected_value = expected_config.get(key)
         actual_value = checkpoint_config.get(key)
+        if key == "max_train_samples" and actual_value is None:
+            actual_value = 0
         if actual_value != expected_value:
             mismatches.append(f"{key}: checkpoint={actual_value!r} current={expected_value!r}")
     if mismatches:
@@ -376,6 +396,64 @@ def write_train_summary(
         encoding="utf-8",
     )
     return final_summary
+
+
+def build_checkpoint_payload(
+    *,
+    completed_epoch: int,
+    resume_epoch: int,
+    resume_batch_index: int,
+    partial_epoch_loss_sum: float,
+    partial_epoch_batches: int,
+    global_step: int,
+    history: List[Dict[str, Any]],
+    run_config: Dict[str, Any],
+    model: custom_whisper.AudioImageWhisper,
+    optimizer: AdamW,
+) -> Dict[str, Any]:
+    return {
+        "epoch": completed_epoch,
+        "resume_epoch": resume_epoch,
+        "resume_batch_index": resume_batch_index,
+        "partial_epoch_loss_sum": partial_epoch_loss_sum,
+        "partial_epoch_batches": partial_epoch_batches,
+        "global_step": global_step,
+        "train_history": history,
+        "train_config": run_config,
+        "feature_fuser_state_dict": model.feature_fuser.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+
+
+def save_last_checkpoint(
+    *,
+    checkpoints_dir: Path,
+    completed_epoch: int,
+    resume_epoch: int,
+    resume_batch_index: int,
+    partial_epoch_loss_sum: float,
+    partial_epoch_batches: int,
+    global_step: int,
+    history: List[Dict[str, Any]],
+    run_config: Dict[str, Any],
+    model: custom_whisper.AudioImageWhisper,
+    optimizer: AdamW,
+) -> Path:
+    checkpoint_payload = build_checkpoint_payload(
+        completed_epoch=completed_epoch,
+        resume_epoch=resume_epoch,
+        resume_batch_index=resume_batch_index,
+        partial_epoch_loss_sum=partial_epoch_loss_sum,
+        partial_epoch_batches=partial_epoch_batches,
+        global_step=global_step,
+        history=history,
+        run_config=run_config,
+        model=model,
+        optimizer=optimizer,
+    )
+    checkpoint_path = checkpoints_dir / "last.pt"
+    torch.save(checkpoint_payload, checkpoint_path)
+    return checkpoint_path
 
 
 def main() -> None:
@@ -464,13 +542,7 @@ def main() -> None:
         tokenizer=tokenizer,
     )
     collate_fn = partial(collate_supervised_batch, config=batch_config)
-    train_loader = DataLoader(
-        VisSpeechPreparedDataset(train_rows),
-        batch_size=max(1, args.batch_size),
-        shuffle=True,
-        num_workers=max(0, args.num_workers),
-        collate_fn=collate_fn,
-    )
+    train_dataset = VisSpeechPreparedDataset(train_rows)
 
     trainable_parameters = [parameter for parameter in model.feature_fuser.parameters() if parameter.requires_grad]
     if not trainable_parameters:
@@ -498,11 +570,13 @@ def main() -> None:
         "attn_dropout": args.attn_dropout,
         "attn_gate_init": args.attn_gate_init,
         "attn_num_queries": args.attn_num_queries,
+        "max_train_samples": args.max_train_samples,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "grad_clip_norm": args.grad_clip_norm,
+        "save_every_batches": args.save_every_batches,
         "seed": args.seed,
         "device": str(device),
         "freeze_stats": freeze_stats,
@@ -519,6 +593,9 @@ def main() -> None:
     best_loss = math.inf
     global_step = 0
     start_epoch = 1
+    resume_batch_index = 0
+    partial_epoch_loss_sum = 0.0
+    partial_epoch_batches = 0
 
     if resume_checkpoint is not None:
         model.feature_fuser.load_state_dict(resume_checkpoint["feature_fuser_state_dict"])
@@ -534,7 +611,13 @@ def main() -> None:
         history = list(resume_checkpoint.get("train_history") or [])
         best_loss = infer_best_loss(history)
         global_step = int(resume_checkpoint.get("global_step", 0))
-        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+        if "resume_epoch" in resume_checkpoint:
+            start_epoch = int(resume_checkpoint.get("resume_epoch", 1))
+            resume_batch_index = int(resume_checkpoint.get("resume_batch_index", 0))
+            partial_epoch_loss_sum = float(resume_checkpoint.get("partial_epoch_loss_sum", 0.0))
+            partial_epoch_batches = int(resume_checkpoint.get("partial_epoch_batches", 0))
+        else:
+            start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
 
     print(f"[INFO] device={device}")
     print(f"[INFO] train_rows={len(train_rows)}")
@@ -546,6 +629,8 @@ def main() -> None:
         completed_epochs = start_epoch - 1
         print(f"[INFO] resume_from={resume_from_path}")
         print(f"[INFO] completed_epochs={completed_epochs} target_epochs={args.epochs}")
+        if resume_batch_index > 0:
+            print(f"[INFO] resume_batch_index={resume_batch_index}")
 
     if start_epoch > args.epochs:
         (output_root / "train_history.json").write_text(
@@ -570,11 +655,24 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start_time = time.time()
         set_fuser_training_mode(model)
-        running_loss = 0.0
-        running_batches = 0
+        epoch_generator = torch.Generator()
+        epoch_generator.manual_seed(args.seed + epoch)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=max(1, args.batch_size),
+            shuffle=True,
+            generator=epoch_generator,
+            num_workers=max(0, args.num_workers),
+            collate_fn=collate_fn,
+        )
+        epoch_total_batches = len(train_loader)
+        completed_batches_before_resume = resume_batch_index if epoch == start_epoch else 0
+        running_loss = partial_epoch_loss_sum if epoch == start_epoch else 0.0
+        running_batches = partial_epoch_batches if epoch == start_epoch else 0
+        last_completed_batch = completed_batches_before_resume
         progress_bar = (
             tqdm(
-                total=len(train_loader),
+                total=epoch_total_batches,
                 desc=f"train epoch {epoch}/{args.epochs}",
                 dynamic_ncols=True,
                 leave=True,
@@ -582,30 +680,57 @@ def main() -> None:
             if tqdm is not None
             else None
         )
+        if progress_bar is not None and completed_batches_before_resume > 0:
+            progress_bar.update(completed_batches_before_resume)
+            progress_bar.set_postfix(
+                loss="resume",
+                elapsed="0s",
+                eta="?",
+            )
 
         try:
             for batch_index, batch in enumerate(train_loader, start=1):
+                if batch_index <= completed_batches_before_resume:
+                    continue
                 optimizer.zero_grad(set_to_none=True)
-                loss = forward_fuser_only_loss(
-                    model,
-                    batch,
-                    device=device,
-                    use_images=True,
-                    specaug_module=specaug_module,
-                )
-                loss.backward()
-                if args.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=args.grad_clip_norm)
-                optimizer.step()
+                try:
+                    loss = forward_fuser_only_loss(
+                        model,
+                        batch,
+                        device=device,
+                        use_images=True,
+                        specaug_module=specaug_module,
+                    )
+                    loss.backward()
+                    if args.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=args.grad_clip_norm)
+                    optimizer.step()
+                except KeyboardInterrupt:
+                    checkpoint_path = save_last_checkpoint(
+                        checkpoints_dir=checkpoints_dir,
+                        completed_epoch=epoch - 1,
+                        resume_epoch=epoch,
+                        resume_batch_index=last_completed_batch,
+                        partial_epoch_loss_sum=running_loss,
+                        partial_epoch_batches=running_batches,
+                        global_step=global_step,
+                        history=history,
+                        run_config=run_config,
+                        model=model,
+                        optimizer=optimizer,
+                    )
+                    print(f"[INTERRUPTED] saved_checkpoint={checkpoint_path}")
+                    raise
 
                 loss_value = float(loss.detach().cpu().item())
                 running_loss += loss_value
                 running_batches += 1
                 global_step += 1
+                last_completed_batch = batch_index
 
                 elapsed_seconds = time.time() - epoch_start_time
                 avg_batch_seconds = elapsed_seconds / max(1, running_batches)
-                remaining_batches = max(0, len(train_loader) - batch_index)
+                remaining_batches = max(0, epoch_total_batches - batch_index)
                 eta_seconds = avg_batch_seconds * remaining_batches
 
                 if progress_bar is not None:
@@ -616,10 +741,10 @@ def main() -> None:
                         eta=f"{eta_seconds:.0f}s",
                     )
 
-                if batch_index == 1 or batch_index % max(1, args.log_every) == 0 or batch_index == len(train_loader):
+                if batch_index == 1 or batch_index % max(1, args.log_every) == 0 or batch_index == epoch_total_batches:
                     message = (
                         f"[TRAIN] epoch={epoch}/{args.epochs} "
-                        f"batch={batch_index}/{len(train_loader)} "
+                        f"batch={batch_index}/{epoch_total_batches} "
                         f"loss={loss_value:.6f} "
                         f"elapsed={elapsed_seconds:.1f}s "
                         f"eta_epoch={eta_seconds:.1f}s"
@@ -628,6 +753,46 @@ def main() -> None:
                         progress_bar.write(message)
                     else:
                         print(message)
+                if (
+                    args.save_every_batches > 0
+                    and batch_index % max(1, args.save_every_batches) == 0
+                    and batch_index < epoch_total_batches
+                ):
+                    checkpoint_path = save_last_checkpoint(
+                        checkpoints_dir=checkpoints_dir,
+                        completed_epoch=epoch - 1,
+                        resume_epoch=epoch,
+                        resume_batch_index=batch_index,
+                        partial_epoch_loss_sum=running_loss,
+                        partial_epoch_batches=running_batches,
+                        global_step=global_step,
+                        history=history,
+                        run_config=run_config,
+                        model=model,
+                        optimizer=optimizer,
+                    )
+                    if progress_bar is not None:
+                        progress_bar.write(
+                            f"[CHECKPOINT] saved={checkpoint_path} batch={batch_index}/{epoch_total_batches}"
+                        )
+                    else:
+                        print(f"[CHECKPOINT] saved={checkpoint_path} batch={batch_index}/{epoch_total_batches}")
+        except KeyboardInterrupt:
+            checkpoint_path = save_last_checkpoint(
+                checkpoints_dir=checkpoints_dir,
+                completed_epoch=epoch - 1,
+                resume_epoch=epoch,
+                resume_batch_index=last_completed_batch,
+                partial_epoch_loss_sum=running_loss,
+                partial_epoch_batches=running_batches,
+                global_step=global_step,
+                history=history,
+                run_config=run_config,
+                model=model,
+                optimizer=optimizer,
+            )
+            print(f"[INTERRUPTED] saved_checkpoint={checkpoint_path}")
+            raise
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -647,14 +812,18 @@ def main() -> None:
             f"seconds={epoch_seconds:.1f}"
         )
 
-        checkpoint_payload = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "train_history": history,
-            "train_config": run_config,
-            "feature_fuser_state_dict": model.feature_fuser.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }
+        checkpoint_payload = build_checkpoint_payload(
+            completed_epoch=epoch,
+            resume_epoch=epoch + 1,
+            resume_batch_index=0,
+            partial_epoch_loss_sum=0.0,
+            partial_epoch_batches=0,
+            global_step=global_step,
+            history=history,
+            run_config=run_config,
+            model=model,
+            optimizer=optimizer,
+        )
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
@@ -668,6 +837,9 @@ def main() -> None:
             json.dumps(history, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        resume_batch_index = 0
+        partial_epoch_loss_sum = 0.0
+        partial_epoch_batches = 0
 
     final_summary = write_train_summary(
         output_root=output_root,

@@ -65,6 +65,7 @@ Common overrides:
 ```bash
 PYTHON_BIN=python \
 BATCH_SIZE=2 \
+SAVE_EVERY_BATCHES=50 \
 OFFLINE=0 \
 WHISPER_MODEL=medium.en \
 CLIP_MODEL_NAME=openai/clip-vit-base-patch32 \
@@ -72,3 +73,25 @@ bash scripts/run_flickr8k_subset_requested_models.sh
 ```
 
 Outputs are written under `outputs/<suite_tag>/`.
+
+## Resume an interrupted run
+
+`scripts/run_flickr8k_custom_whisper_fuser.sh` will automatically resume from:
+
+```text
+<experiment_root>/model/checkpoints/last.pt
+```
+
+The training script now refreshes `last.pt` every `SAVE_EVERY_BATCHES` completed batches, so a killed job can resume inside the same epoch instead of restarting that epoch from batch 1.
+
+Manual resume example:
+
+```bash
+python scripts/train_visspeech_custom_whisper_fuser.py \
+  --train-manifest data/flickr8k/prepared/subsets/2_per_image_random_sel42_split42_test20/train_manifest.jsonl \
+  --output-root outputs/my_resume_run/model \
+  --whisper-model medium.en \
+  --visual-encoder clip \
+  --visual-fuser cross_attn_gate \
+  --resume-from outputs/my_resume_run/model/checkpoints/last.pt
+```
